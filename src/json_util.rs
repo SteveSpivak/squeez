@@ -97,11 +97,25 @@ pub fn extract_str_array(json: &str, key: &str) -> Vec<String> {
 }
 
 /// Escape a string for inclusion in a JSON string value (not quoted).
+///
+/// Handles the full C0 range, not just the four characters that show up in
+/// hand-written test fixtures. It used to escape `\` `"` `\n` and drop `\r`,
+/// which silently produced INVALID JSON for any other control character --
+/// and squeez captures raw command output, so `\t` in a test summary or a
+/// stray `\x1b` from an ANSI sequence that outran the filter is routine, not
+/// exotic. Three records in a 683-line summaries.jsonl were unparseable for
+/// exactly this reason, and every one of the 31 call sites emits JSON that
+/// something else has to read back: session JSONL, memory summaries, MCP
+/// JSON-RPC replies, benchmark output.
+///
+/// Delegates to `escape_strict` rather than repeating the table, so the two
+/// escapers in this file cannot disagree about what valid JSON is. Note `\r`
+/// is now escaped rather than dropped: preserving the byte is what a JSON
+/// escaper is for, and dropping it corrupted CRLF output silently.
 pub fn escape_str(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "")
+    let mut out = String::with_capacity(s.len());
+    escape_strict(s, &mut out);
+    out
 }
 
 /// Serialize a string slice as a JSON array of strings.
