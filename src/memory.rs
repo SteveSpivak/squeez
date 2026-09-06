@@ -245,21 +245,29 @@ pub fn read_last_n(memory_dir: &Path, n: usize) -> Vec<Summary> {
 pub fn write_summary(memory_dir: &Path, summary: &Summary) {
     let path = memory_dir.join("summaries.jsonl");
     let offset = jsonl_current_size(memory_dir);
+    // Single write_all per record, not writeln! -- `write_fmt` emits one
+    // syscall per format fragment, and under O_APPEND a concurrent writer can
+    // land between the record and its newline. See `session::append_event` for
+    // the full explanation and the corruption it caused there. The stakes are
+    // higher here: the index below stores a BYTE OFFSET into this file, so a
+    // torn append desynchronises every subsequent lookup, not just one line.
+    let line = format!("{}\n", summary.to_jsonl_line());
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{}", summary.to_jsonl_line());
+        let _ = f.write_all(line.as_bytes());
     }
-    // Append to index
+    // Append to index. Three fragments through writeln! meant three syscalls.
+    let idx_line = format!("{}\t{}\n", summary.ts, offset);
     let idx_path = index_path(memory_dir);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&idx_path)
     {
-        let _ = writeln!(f, "{}\t{}", summary.ts, offset);
+        let _ = f.write_all(idx_line.as_bytes());
     }
 }
 

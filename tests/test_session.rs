@@ -110,3 +110,70 @@ fn test_home_dir_returns_nonempty() {
     let home = squeez::session::home_dir();
     assert!(!home.is_empty(), "home_dir() returned empty string");
 }
+
+/// Concurrent appends must never interleave a record with another's newline.
+///
+/// The old implementation used `writeln!`, which is `write_fmt` -- one syscall
+/// for the record, another for `\n`. Under O_APPEND both are individually
+/// atomic, so a second writer landing between them produced two JSON objects
+/// on one line. 15 records across 12 real session files were corrupted this
+/// way. Threads here stand in for the concurrent hooks (PostToolUse,
+/// SubagentStop, and the wrap subprocess all append to the same file).
+///
+/// Asserted on line COUNT and per-line parseability rather than on file size:
+/// a torn write preserves total bytes exactly, so a size check passes while
+/// the file is unreadable -- which is how this survived unnoticed.
+#[test]
+fn test_concurrent_appends_never_split_a_record_from_its_newline() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeez-append-race-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 60;
+    // Long payloads widen the window between the two syscalls the old code made.
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let payload = "x".repeat(400 + t * 7);
+                    let event =
+                        format!(r#"{{"type":"bash","t":{},"i":{},"pad":"{}"}}"#, t, i, payload);
+                    squeez::session::append_event(&dir, "race.jsonl", &event);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let content = std::fs::read_to_string(dir.join("race.jsonl")).unwrap();
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    assert_eq!(
+        lines.len(),
+        THREADS * PER_THREAD,
+        "expected one line per append; a torn write merges two records onto one line"
+    );
+    for (n, line) in lines.iter().enumerate() {
+        assert_eq!(
+            line.matches(r#"{"type""#).count(),
+            1,
+            "line {} holds {} records -- a record was split from its newline: {}",
+            n + 1,
+            line.matches(r#"{"type""#).count(),
+            &line[..line.len().min(120)]
+        );
+        assert!(line.starts_with('{') && line.ends_with('}'), "line {} truncated", n + 1);
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
