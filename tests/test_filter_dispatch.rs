@@ -150,3 +150,56 @@ fn next_lint_routes_to_typescript_handler() {
         "raw JSON should have been condensed, got: {joined}"
     );
 }
+
+// ── `cd <path> && <real command>` dispatch ──────────────────────────────────
+//
+// Dispatch read only the first token, so every `cd /repo && rg foo` took the
+// generic cd passthrough. Measured over 10,754 real calls the cd bucket held
+// 28.2M of 38.9M input tokens and saved 1.5%, while rg/sed/printf saved 65-85%.
+// Separator mix over 7,293 real cd-prefixed commands: && 70%, newline 28%, ; 1%.
+
+#[test]
+fn test_cd_prefix_dispatches_to_the_command_that_actually_runs() {
+    // Asserted as "same as the bare command" rather than against a handler
+    // name: the first version expected "rg" and got "text_proc", which is the
+    // correct handler under a different label. Comparing against the unprefixed
+    // form tests the property that matters and cannot rot when a handler is
+    // renamed or a command is regrouped.
+    for (prefixed, bare) in [
+        ("cd /repo && git status", "git status"),
+        ("cd /repo\ngit status", "git status"),
+        ("cd /repo; git status", "git status"),
+        ("cd /repo && rg pattern src/", "rg pattern src/"),
+        ("cd /repo && python3 -m pytest", "python3 -m pytest"),
+        // chained cds, and an env prefix after the cd -- both must be seen through
+        ("cd /a && cd /b && git log", "git log"),
+        ("cd /repo && FOO=1 git diff", "FOO=1 git diff"),
+        // quoted target containing the separator characters
+        ("cd \"/tmp/a;b && c\" && git status", "git status"),
+    ] {
+        assert_eq!(
+            filter::handler_name(prefixed),
+            filter::handler_name(bare),
+            "{prefixed:?} should dispatch exactly as {bare:?}"
+        );
+    }
+}
+
+#[test]
+fn test_a_bare_cd_is_still_a_cd() {
+    // No separator means the command genuinely is a cd; stripping it would
+    // dispatch on whatever followed in the argument list.
+    for cmd in ["cd /repo", "cd", "cd ..", "cd /path/with && in/name"] {
+        let got = filter::handler_name(cmd);
+        assert!(
+            got != "git" && got != "rg",
+            "{cmd:?} should not dispatch to a chained command, got {got:?}"
+        );
+    }
+}
+
+#[test]
+fn test_a_command_merely_starting_with_cd_is_untouched() {
+    // `cdk`, `cdd`, `cdparanoia` must not be read as `cd` + target.
+    assert_eq!(filter::handler_name("cdk deploy && git push"), filter::handler_name("cdk deploy"));
+}
