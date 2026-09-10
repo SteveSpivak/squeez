@@ -22,6 +22,17 @@ pub fn squeez_dir() -> PathBuf {
 pub fn sessions_dir() -> PathBuf {
     squeez_dir().join("sessions")
 }
+
+/// Directory for short-lived cross-hook handoff files (e.g. PostCompact's
+/// pending-context relay, consumed by the next UserPromptSubmit). Overridable
+/// via SQUEEZ_STATE_DIR so a host-side relay script (dcoder's
+/// userprompt_guard.sh) and squeez agree on the path without sharing SQUEEZ_DIR.
+pub fn state_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("SQUEEZ_STATE_DIR") {
+        return PathBuf::from(d);
+    }
+    squeez_dir().join("state")
+}
 pub fn memory_dir() -> PathBuf {
     squeez_dir().join("memory")
 }
@@ -214,6 +225,22 @@ const MAX_SESSION_LOG_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Appends one JSONL line to the session log file (creates if missing).
 /// Silently skips if the file exceeds MAX_SESSION_LOG_BYTES.
+///
+/// The record and its newline are written in a SINGLE `write_all`, never with
+/// `writeln!`. `write!`/`writeln!` go through `Write::write_fmt`, which issues
+/// one `write()` syscall per format fragment -- one for the record, another for
+/// the `\n`. Under `O_APPEND` each syscall is individually atomic, so a second
+/// process appending between those two lands its record before our newline and
+/// the file gets `...8472}{"type":"bash"...`: two objects on one line, both
+/// unreadable. That produced 15 corrupt records across 12 session files before
+/// this was found. Hooks fire concurrently (PostToolUse, SubagentStop, and the
+/// wrap subprocess all write here), so this is the normal case, not a rare race.
+///
+/// Caveat kept honest: a single `write_all` still loops on a partial write, and
+/// records here can be large (one observed at 138 KB). A kernel that returns a
+/// short count would reintroduce the split. Regular-file writes do not do this
+/// in practice on macOS or Linux, and the fix removes the guaranteed two-syscall
+/// split, which is what was actually corrupting the logs.
 pub fn append_event(sessions_dir: &Path, session_file: &str, event_json: &str) {
     if session_file.is_empty() || session_file.contains('/') || session_file.contains("..") {
         return;
@@ -222,6 +249,12 @@ pub fn append_event(sessions_dir: &Path, session_file: &str, event_json: &str) {
     if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_SESSION_LOG_BYTES {
         return;
     }
+    // One buffer, one write_all -- see the doc comment above for why this must
+    // not be writeln!.
+    let mut line = String::with_capacity(event_json.len() + 1);
+    line.push_str(event_json);
+    line.push('\n');
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -231,7 +264,7 @@ pub fn append_event(sessions_dir: &Path, session_file: &str, event_json: &str) {
             .mode(0o600)
             .open(&path)
         {
-            let _ = writeln!(f, "{}", event_json);
+            let _ = f.write_all(line.as_bytes());
         }
     }
     #[cfg(not(unix))]
@@ -241,7 +274,7 @@ pub fn append_event(sessions_dir: &Path, session_file: &str, event_json: &str) {
             .append(true)
             .open(&path)
         {
-            let _ = writeln!(f, "{}", event_json);
+            let _ = f.write_all(line.as_bytes());
         }
     }
 }

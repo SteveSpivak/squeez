@@ -267,7 +267,7 @@ pub fn verify_sha256(bytes: &[u8], expected_hex: &str) -> bool {
     }
 }
 
-fn compute_sha256(bytes: &[u8]) -> Option<String> {
+pub(crate) fn compute_sha256(bytes: &[u8]) -> Option<String> {
     // Try sha256sum then shasum -a 256
     for (cmd, args) in [
         ("sha256sum", vec![]),

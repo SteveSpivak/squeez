@@ -6,15 +6,21 @@
 //! recent git refs — and re-discovers it with fresh tool calls.
 //!
 //! A PreCompact hook can't steer the built-in summarizer (researched: no
-//! custom-instructions / transcript-rewrite API; it can only block). But a
-//! **PostCompact** hook can return `additionalContext` that survives into the
-//! freshly-compacted context. So squeez re-injects its own accumulated session
-//! state — which it already tracks in `SessionContext` — as a dense block,
-//! plus pointers to any `squeez_retrieve` blobs holding outputs that
-//! compaction dropped.
+//! custom-instructions / transcript-rewrite API; it can only block). And,
+//! contrary to this module's original design, a PostCompact hook can't
+//! deliver `additionalContext` either: PostCompact is display-only (verified
+//! against the current Claude Code hooks reference) and only supports
+//! `systemMessage` / `terminalSequence` — `hookSpecificOutput.additionalContext`
+//! is a UserPromptSubmit-only shape, and printing it from a PostCompact hook
+//! fails the host's schema validation.
 //!
-//! Output is the Claude Code PostCompact hook JSON shape; the hook script
-//! prints it on stdout.
+//! So the PostCompact hook instead writes the summary to a pending file keyed
+//! by a hashed session id, under `session::state_dir()`. A separate relay
+//! (dcoder's `userprompt_guard.sh`) reads that file on the very next
+//! `UserPromptSubmit` — the one event that genuinely supports
+//! `additionalContext` — and deletes it. This module only ever writes; it
+//! does not assume anything reads the file, so it degrades to "no re-injection
+//! this compaction" rather than failing if no relay is registered.
 
 use crate::context::cache::SessionContext;
 use crate::context::retrieve;
@@ -122,17 +128,106 @@ mod tests {
         assert!(out.ends_with('…'));
         assert!(out.chars().count() <= 81);
     }
+
+    #[test]
+    fn safe_id_matches_known_sha256_vector() {
+        // sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        // first 32 hex chars -- must match the Python hashlib derivation
+        // dcoder's userprompt_guard.sh relies on, byte for byte, or the
+        // relay will never find the file this writes.
+        if let Some(id) = safe_id("abc") {
+            assert_eq!(id, "ba7816bf8f01cfea414140de5dae2223");
+        }
+        // else: no sha256sum/shasum on this machine's PATH -- degrades to
+        // "nothing written," never to a wrong filename, so skip rather than
+        // fail on an environment that can't exercise this at all.
+    }
+
+    #[test]
+    fn run_with_input_returns_none_and_defers_to_pending_file_when_session_id_present() {
+        // Can't easily isolate SQUEEZ_STATE_DIR from an in-process unit test
+        // (global env var, parallel test execution) -- that side effect is
+        // covered by the tests/test_compact_postcompact.rs integration
+        // suite, which spawns the real binary per-test with its own env.
+        // This test only pins the *return-value* contract: a present,
+        // non-empty session_id must never surface additionalContext text on
+        // stdout, because PostCompact hook stdout is what fails schema
+        // validation.
+        if build_summary().is_none() {
+            return; // nothing to report in this test's own environment
+        }
+        let out = run_with_input(r#"{"session_id":"abc"}"#);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn run_with_input_returns_summary_text_when_no_session_id() {
+        let Some(expected) = build_summary() else {
+            return; // nothing to report in this test's own environment
+        };
+        let out = run_with_input("{}");
+        assert_eq!(out, Some(expected));
+    }
 }
 
-/// Emit the PostCompact hook JSON on stdout. Always exits 0 — re-injection is
-/// best-effort and must never disrupt the host.
-pub fn run() -> i32 {
-    if let Some(text) = build_summary() {
-        println!(
-            "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PostCompact\",\"additionalContext\":\"{}\"}}}}",
-            crate::json_util::escape_str(&text)
-        );
+/// Derive the same hashed filename component the UserPromptSubmit relay
+/// script expects: sha256(session_id) hex, first 32 chars. Matches
+/// dcoder's userprompt_guard.sh derivation (Python hashlib.sha256) byte for
+/// byte — `sha256sum`/`shasum` and hashlib agree on lowercase hex digests.
+fn safe_id(session_id: &str) -> Option<String> {
+    let hash = crate::commands::update::compute_sha256(session_id.as_bytes())?;
+    Some(hash.chars().take(32).collect())
+}
+
+/// Write the pending-context file a UserPromptSubmit relay will pick up and
+/// delete on the next prompt. No-op (returns false) if hashing is
+/// unavailable (no sha256sum/shasum on PATH) — callers treat that the same
+/// as "nothing to re-inject," never as an error.
+fn write_pending(session_id: &str, text: &str) -> bool {
+    let Some(id) = safe_id(session_id) else {
+        return false;
+    };
+    let dir = session::state_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
     }
+    let path = dir.join(format!("postcompact.pending.{id}.json"));
+    let payload = format!(
+        "{{\"additionalContext\":\"{}\"}}",
+        crate::json_util::escape_str(text)
+    );
+    std::fs::write(path, payload).is_ok()
+}
+
+/// Core logic, parameterized on the hook's stdin payload for testability.
+/// Returns the plain-text summary when there's no `session_id` to key a
+/// pending file by (e.g. manual `squeez compact-summary` with no piped hook
+/// JSON) — callers decide whether that's worth printing.
+fn run_with_input(hook_input: &str) -> Option<String> {
+    let Some(text) = build_summary() else {
+        return None;
+    };
+    match crate::json_util::extract_str(hook_input, "session_id") {
+        Some(session_id) if !session_id.is_empty() => {
+            write_pending(&session_id, &text);
+            None
+        }
+        _ => Some(text),
+    }
+}
+
+/// PostCompact hook entrypoint. Always exits 0 — re-injection is best-effort
+/// and must never disrupt the host. Prints nothing when running as a real
+/// hook (delivery happens via the pending-file relay); prints the plain
+/// summary when run manually with no session id on stdin, for debugging.
+pub fn run() -> i32 {
+    let mut hook_input = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut hook_input);
+
+    if let Some(text) = run_with_input(&hook_input) {
+        println!("{text}");
+    }
+
     // The header tag-dedup memo (E1) tracks what the model has already seen;
     // compaction rebuilds the model's context from scratch, so the memo must
     // reset or an unchanged budget/agent tag would stay suppressed even
